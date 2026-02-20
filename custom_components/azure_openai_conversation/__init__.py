@@ -2,25 +2,22 @@
 
 from __future__ import annotations
 
-import base64
-from mimetypes import guess_file_type
 from pathlib import Path
+from types import MappingProxyType
 
 import openai
 from openai.types.images_response import ImagesResponse
 from openai.types.responses import (
     EasyInputMessageParam,
     Response,
-    ResponseInputFileParam,
-    ResponseInputImageParam,
     ResponseInputMessageContentListParam,
     ResponseInputParam,
     ResponseInputTextParam,
 )
 import voluptuous as vol
 
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CONF_API_KEY, Platform
+from homeassistant.config_entries import ConfigEntry, ConfigSubentry
+from homeassistant.const import CONF_API_KEY, CONF_CLIENT_ID, CONF_CLIENT_SECRET, Platform
 from homeassistant.core import (
     HomeAssistant,
     ServiceCall,
@@ -28,11 +25,17 @@ from homeassistant.core import (
     SupportsResponse,
 )
 from homeassistant.exceptions import (
+    ConfigEntryAuthFailed,
     ConfigEntryNotReady,
     HomeAssistantError,
     ServiceValidationError,
 )
-from homeassistant.helpers import config_validation as cv, selector
+from homeassistant.helpers import (
+    config_validation as cv,
+    device_registry as dr,
+    entity_registry as er,
+    selector,
+)
 from homeassistant.helpers.httpx_client import get_async_client
 from homeassistant.helpers.typing import ConfigType
 
@@ -44,36 +47,34 @@ from .const import (
     CONF_PROMPT,
     CONF_REASONING_EFFORT,
     CONF_TEMPERATURE,
+    CONF_TENANT_ID,
     CONF_TOP_P,
+    CONF_USE_ENTRA_ID_AUTH,
+    DEFAULT_AI_TASK_NAME,
+    DEFAULT_NAME,
     DOMAIN,
     LOGGER,
+    RECOMMENDED_AI_TASK_OPTIONS,
     RECOMMENDED_CHAT_MODEL,
     RECOMMENDED_MAX_TOKENS,
     RECOMMENDED_REASONING_EFFORT,
     RECOMMENDED_TEMPERATURE,
     RECOMMENDED_TOP_P,
 )
+from .entity import async_prepare_files_for_prompt
 
 SERVICE_GENERATE_IMAGE = "generate_image"
 SERVICE_GENERATE_CONTENT = "generate_content"
 
-PLATFORMS = (Platform.CONVERSATION,)
+PLATFORMS = (Platform.AI_TASK, Platform.CONVERSATION)
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
-type OpenAIConfigEntry = ConfigEntry[openai.AsyncClient]
-
-
-def encode_file(file_path: str) -> tuple[str, str]:
-    """Return base64 version of file contents."""
-    mime_type, _ = guess_file_type(file_path)
-    if mime_type is None:
-        mime_type = "application/octet-stream"
-    with open(file_path, "rb") as image_file:
-        return (mime_type, base64.b64encode(image_file.read()).decode("utf-8"))
+type AzureOpenAIConfigEntry = ConfigEntry[openai.AsyncClient]
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up Azure OpenAI Conversation."""
+    await async_migrate_integration(hass)
 
     async def render_image(call: ServiceCall) -> ServiceResponse:
         """Render an image with dall-e."""
@@ -99,6 +100,9 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
                 response_format="url",
                 n=1,
             )
+        except openai.AuthenticationError as err:
+            entry.async_start_reauth(hass)
+            raise HomeAssistantError("Authentication error") from err
         except openai.OpenAIError as err:
             raise HomeAssistantError(f"Error generating image: {err}") from err
 
@@ -119,77 +123,72 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
                 translation_placeholders={"config_entry": entry_id},
             )
 
-        model: str = entry.options.get(CONF_CHAT_MODEL, RECOMMENDED_CHAT_MODEL)
+        # Get first conversation subentry for options
+        conversation_subentry = next(
+            (
+                sub
+                for sub in entry.subentries.values()
+                if sub.subentry_type == "conversation"
+            ),
+            None,
+        )
+        if not conversation_subentry:
+            raise ServiceValidationError("No conversation configuration found")
+
+        model: str = conversation_subentry.data.get(
+            CONF_CHAT_MODEL, RECOMMENDED_CHAT_MODEL
+        )
         client: openai.AsyncClient = entry.runtime_data
 
         content: ResponseInputMessageContentListParam = [
             ResponseInputTextParam(type="input_text", text=call.data[CONF_PROMPT])
         ]
 
-        def append_files_to_content() -> None:
-            for filename in call.data[CONF_FILENAMES]:
+        if filenames := call.data.get(CONF_FILENAMES):
+            for filename in filenames:
                 if not hass.config.is_allowed_path(filename):
                     raise HomeAssistantError(
                         f"Cannot read `{filename}`, no access to path; "
                         "`allowlist_external_dirs` may need to be adjusted in "
                         "`configuration.yaml`"
                     )
-                if not Path(filename).exists():
-                    raise HomeAssistantError(f"`{filename}` does not exist")
-                mime_type, base64_file = encode_file(filename)
-                if "image/" in mime_type:
-                    content.append(
-                        ResponseInputImageParam(
-                            type="input_image",
-                            image_url=f"data:{mime_type};base64,{base64_file}",
-                            detail="auto",
-                        )
-                    )
-                elif "application/pdf" in mime_type:
-                    content.append(
-                        ResponseInputFileParam(
-                            type="input_file",
-                            filename=filename,
-                            file_data=f"data:{mime_type};base64,{base64_file}",
-                        )
-                    )
-                else:
-                    raise HomeAssistantError(
-                        "Only images and PDF are supported by the OpenAI API,"
-                        f"`{filename}` is not an image file or PDF"
-                    )
 
-        if CONF_FILENAMES in call.data:
-            await hass.async_add_executor_job(append_files_to_content)
+            content.extend(
+                await async_prepare_files_for_prompt(
+                    hass, [(Path(filename), None) for filename in filenames]
+                )
+            )
 
         messages: ResponseInputParam = [
             EasyInputMessageParam(type="message", role="user", content=content)
         ]
 
-        try:
-            model_args = {
-                "model": model,
-                "input": messages,
-                "max_output_tokens": entry.options.get(
-                    CONF_MAX_TOKENS, RECOMMENDED_MAX_TOKENS
-                ),
-                "top_p": entry.options.get(CONF_TOP_P, RECOMMENDED_TOP_P),
-                "temperature": entry.options.get(
-                    CONF_TEMPERATURE, RECOMMENDED_TEMPERATURE
-                ),
-                "user": call.context.user_id,
-                "store": False,
+        model_args = {
+            "model": model,
+            "input": messages,
+            "max_output_tokens": conversation_subentry.data.get(
+                CONF_MAX_TOKENS, RECOMMENDED_MAX_TOKENS
+            ),
+            "top_p": conversation_subentry.data.get(CONF_TOP_P, RECOMMENDED_TOP_P),
+            "temperature": conversation_subentry.data.get(
+                CONF_TEMPERATURE, RECOMMENDED_TEMPERATURE
+            ),
+            "user": call.context.user_id,
+            "store": False,
+        }
+
+        if model.startswith("o"):
+            model_args["reasoning"] = {
+                "effort": conversation_subentry.data.get(
+                    CONF_REASONING_EFFORT, RECOMMENDED_REASONING_EFFORT
+                )
             }
 
-            if model.startswith("o"):
-                model_args["reasoning"] = {
-                    "effort": entry.options.get(
-                        CONF_REASONING_EFFORT, RECOMMENDED_REASONING_EFFORT
-                    )
-                }
-
+        try:
             response: Response = await client.responses.create(**model_args)
-
+        except openai.AuthenticationError as err:
+            entry.async_start_reauth(hass)
+            raise HomeAssistantError("Authentication error") from err
         except openai.OpenAIError as err:
             raise HomeAssistantError(f"Error generating content: {err}") from err
         except FileNotFoundError as err:
@@ -242,14 +241,27 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     return True
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: OpenAIConfigEntry) -> bool:
+async def async_setup_entry(hass: HomeAssistant, entry: AzureOpenAIConfigEntry) -> bool:
     """Set up Azure OpenAI Conversation from a config entry."""
 
-    client = openai.AsyncOpenAI(
+    if entry.data.get(CONF_USE_ENTRA_ID_AUTH, False):
+        from azure.identity.aio import ClientSecretCredential, get_bearer_token_provider
+
+        credential = ClientSecretCredential(
+            tenant_id=entry.data[CONF_TENANT_ID],
+            client_id=entry.data[CONF_CLIENT_ID],
+            client_secret=entry.data[CONF_CLIENT_SECRET],
+        )
+
+        token_provider = get_bearer_token_provider(credential, "https://cognitiveservices.azure.com/.default")
+    else:
+        token_provider = entry.data[CONF_API_KEY]
+
+    client = openai.AsyncAzureOpenAI(
         base_url=normalize_azure_endpoint(entry.data[CONF_API_BASE]),
-        default_query={"api-version": "preview"},
-        api_key=entry.data[CONF_API_KEY],
-        http_client=get_async_client(hass),
+        api_version="latest",
+        api_key=token_provider,
+        http_client=get_async_client(hass)
     )
 
     # Cache current platform data which gets added to each request (caching done by library)
@@ -258,8 +270,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: OpenAIConfigEntry) -> bo
     try:
         await hass.async_add_executor_job(client.with_options(timeout=10.0).models.list)
     except openai.AuthenticationError as err:
-        LOGGER.error("Invalid API key: %s", err)
-        return False
+        raise ConfigEntryAuthFailed(err) from err
     except openai.OpenAIError as err:
         raise ConfigEntryNotReady(err) from err
 
@@ -267,12 +278,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: OpenAIConfigEntry) -> bo
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
+    entry.async_on_unload(entry.add_update_listener(async_update_options))
+
     return True
 
 
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_unload_entry(hass: HomeAssistant, entry: AzureOpenAIConfigEntry) -> bool:
     """Unload Azure OpenAI."""
-
     return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
 def normalize_azure_endpoint(uri: str) -> str:
@@ -287,3 +299,195 @@ def normalize_azure_endpoint(uri: str) -> str:
         normalized += '/'
 
     return normalized
+
+
+async def async_update_options(hass: HomeAssistant, entry: AzureOpenAIConfigEntry) -> None:
+    """Update options."""
+    await hass.config_entries.async_reload(entry.entry_id)
+
+
+async def async_migrate_integration(hass: HomeAssistant) -> None:
+    """Migrate integration entry structure."""
+
+    # Make sure we get enabled config entries first
+    entries = sorted(
+        hass.config_entries.async_entries(DOMAIN),
+        key=lambda e: e.disabled_by is not None,
+    )
+    if not any(entry.version == 1 for entry in entries):
+        return
+
+    api_keys_entries: dict[str, tuple[AzureOpenAIConfigEntry, bool]] = {}
+    entity_registry = er.async_get(hass)
+    device_registry = dr.async_get(hass)
+
+    for entry in entries:
+        use_existing = False
+        subentry = ConfigSubentry(
+            data=entry.options,
+            subentry_type="conversation",
+            title=entry.title,
+            unique_id=None,
+        )
+        if entry.data[CONF_API_KEY] not in api_keys_entries:
+            use_existing = True
+            all_disabled = all(
+                e.disabled_by is not None
+                for e in entries
+                if e.data[CONF_API_KEY] == entry.data[CONF_API_KEY]
+            )
+            api_keys_entries[entry.data[CONF_API_KEY]] = (entry, all_disabled)
+
+        parent_entry, all_disabled = api_keys_entries[entry.data[CONF_API_KEY]]
+
+        hass.config_entries.async_add_subentry(parent_entry, subentry)
+        conversation_entity_id = entity_registry.async_get_entity_id(
+            "conversation",
+            DOMAIN,
+            entry.entry_id,
+        )
+        device = device_registry.async_get_device(
+            identifiers={(DOMAIN, entry.entry_id)}
+        )
+
+        if conversation_entity_id is not None:
+            conversation_entity_entry = entity_registry.entities[conversation_entity_id]
+            entity_disabled_by = conversation_entity_entry.disabled_by
+            if (
+                entity_disabled_by is er.RegistryEntryDisabler.CONFIG_ENTRY
+                and not all_disabled
+            ):
+                # Device and entity registries will set the disabled_by flag to None
+                # when moving a device or entity disabled by CONFIG_ENTRY to an enabled
+                # config entry, but we want to set it to DEVICE or USER instead,
+                entity_disabled_by = (
+                    er.RegistryEntryDisabler.DEVICE
+                    if device
+                    else er.RegistryEntryDisabler.USER
+                )
+            entity_registry.async_update_entity(
+                conversation_entity_id,
+                config_entry_id=parent_entry.entry_id,
+                config_subentry_id=subentry.subentry_id,
+                disabled_by=entity_disabled_by,
+                new_unique_id=subentry.subentry_id,
+            )
+
+        if device is not None:
+            # Device and entity registries will set the disabled_by flag to None
+            # when moving a device or entity disabled by CONFIG_ENTRY to an enabled
+            # config entry, but we want to set it to USER instead,
+            device_disabled_by = device.disabled_by
+            if (
+                device.disabled_by is dr.DeviceEntryDisabler.CONFIG_ENTRY
+                and not all_disabled
+            ):
+                device_disabled_by = dr.DeviceEntryDisabler.USER
+            device_registry.async_update_device(
+                device.id,
+                disabled_by=device_disabled_by,
+                new_identifiers={(DOMAIN, subentry.subentry_id)},
+                add_config_subentry_id=subentry.subentry_id,
+                add_config_entry_id=parent_entry.entry_id,
+            )
+            if parent_entry.entry_id != entry.entry_id:
+                device_registry.async_update_device(
+                    device.id,
+                    remove_config_entry_id=entry.entry_id,
+                )
+            else:
+                device_registry.async_update_device(
+                    device.id,
+                    remove_config_entry_id=entry.entry_id,
+                    remove_config_subentry_id=None,
+                )
+
+        if not use_existing:
+            await hass.config_entries.async_remove(entry.entry_id)
+        else:
+            _add_ai_task_subentry(hass, entry)
+            hass.config_entries.async_update_entry(
+                entry,
+                title=DEFAULT_NAME,
+                options={},
+                version=2,
+                minor_version=4,
+            )
+
+
+async def async_migrate_entry(hass: HomeAssistant, entry: AzureOpenAIConfigEntry) -> bool:
+    """Migrate entry."""
+    LOGGER.debug("Migrating from version %s:%s", entry.version, entry.minor_version)
+
+    if entry.version > 2:
+        # This means the user has downgraded from a future version
+        return False
+
+    if entry.version == 2 and entry.minor_version == 1:
+        # Correct broken device migration in Home Assistant Core 2025.7.0b0-2025.7.0b1
+        device_registry = dr.async_get(hass)
+        for device in dr.async_entries_for_config_entry(
+            device_registry, entry.entry_id
+        ):
+            device_registry.async_update_device(
+                device.id,
+                remove_config_entry_id=entry.entry_id,
+                remove_config_subentry_id=None,
+            )
+
+        hass.config_entries.async_update_entry(entry, minor_version=2)
+
+    if entry.version == 2 and entry.minor_version == 2:
+        _add_ai_task_subentry(hass, entry)
+        hass.config_entries.async_update_entry(entry, minor_version=3)
+
+    if entry.version == 2 and entry.minor_version == 3:
+        # Fix migration where the disabled_by flag was not set correctly.
+        # We can currently only correct this for enabled config entries,
+        # because migration does not run for disabled config entries. This
+        # is asserted in tests, and if that behavior is changed, we should
+        # correct also disabled config entries.
+        device_registry = dr.async_get(hass)
+        entity_registry = er.async_get(hass)
+        devices = dr.async_entries_for_config_entry(device_registry, entry.entry_id)
+        entity_entries = er.async_entries_for_config_entry(
+            entity_registry, entry.entry_id
+        )
+        if entry.disabled_by is None:
+            # If the config entry is not disabled, we need to set the disabled_by
+            # flag on devices to USER, and on entities to DEVICE, if they are set
+            # to CONFIG_ENTRY.
+            for device in devices:
+                if device.disabled_by is not dr.DeviceEntryDisabler.CONFIG_ENTRY:
+                    continue
+                device_registry.async_update_device(
+                    device.id,
+                    disabled_by=dr.DeviceEntryDisabler.USER,
+                )
+            for entity in entity_entries:
+                if entity.disabled_by is not er.RegistryEntryDisabler.CONFIG_ENTRY:
+                    continue
+                entity_registry.async_update_entity(
+                    entity.entity_id,
+                    disabled_by=er.RegistryEntryDisabler.DEVICE,
+                )
+        hass.config_entries.async_update_entry(entry, minor_version=4)
+
+    LOGGER.debug(
+        "Migration to version %s:%s successful", entry.version, entry.minor_version
+    )
+
+    return True
+
+
+def _add_ai_task_subentry(hass: HomeAssistant, entry: AzureOpenAIConfigEntry) -> None:
+    """Add AI Task subentry to the config entry."""
+    hass.config_entries.async_add_subentry(
+        entry,
+        ConfigSubentry(
+            data=MappingProxyType(RECOMMENDED_AI_TASK_OPTIONS),
+            subentry_type="ai_task_data",
+            title=DEFAULT_AI_TASK_NAME,
+            unique_id=None,
+        ),
+    )
